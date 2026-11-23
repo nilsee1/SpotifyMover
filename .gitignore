@@ -1,0 +1,34 @@
+# Virtual environment
+.venv/
+venv/
+ENV/
+env/
+
+# Environment files and credentials
+.env
+*.env
+.env.local
+
+# Python cache & bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Missing tracks export files
+missing_tracks.txt
+missing_tracks.csv
+*missing*.txt
+*missing*.csv
+exports/
+
+# Operating system & Editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
