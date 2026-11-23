@@ -3,6 +3,7 @@
 import json
 import pytest
 from src.sources.spotify_embed import (
+    _parse_artists_from_item,
     extract_playlist_id,
     parse_embed_html,
 )
@@ -99,4 +100,44 @@ def test_parse_embed_html_100_track_warning(capsys):
     playlist = parse_embed_html(html, "big_id")
 
     assert len(playlist.tracks) == 100
-    # Confirm that 100 tracks are parsed
+    assert playlist.is_truncated is True
+    assert len(playlist.warnings) == 1
+    assert "100 tracks" in playlist.warnings[0]
+
+    # Verify no prints directly to stdout/stderr
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
+
+
+def test_parse_artists_with_comma_in_name_not_duplicated():
+    item = {
+        "artists": [{"name": "Tyler, The Creator"}],
+        "subtitle": "Tyler, The Creator",
+    }
+    artists = _parse_artists_from_item(item)
+    assert artists == ["Tyler, The Creator"]
+
+
+def test_parse_artists_subtitle_fallback_semicolon_with_comma():
+    item = {
+        "subtitle": "Tyler, The Creator; Kali Uchis",
+    }
+    artists = _parse_artists_from_item(item)
+    assert artists == ["Tyler, The Creator", "Kali Uchis"]
+
+
+def test_parse_artists_subtitle_fallback_comma_only():
+    item = {
+        "subtitle": "Kendrick Lamar, SZA",
+    }
+    artists = _parse_artists_from_item(item)
+    assert artists == ["Kendrick Lamar", "SZA"]
+
+
+def test_parse_artists_deduplication():
+    item = {
+        "artists": ["Daft Punk", "Daft Punk", "Pharrell Williams"],
+    }
+    artists = _parse_artists_from_item(item)
+    assert artists == ["Daft Punk", "Pharrell Williams"]

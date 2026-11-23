@@ -57,3 +57,5 @@ class PlaylistData:
     name: str
     tracks: list[Track] = field(default_factory=list)
     source_type: str = "unknown"
+    warnings: list[str] = field(default_factory=list)
+    is_truncated: bool = False
