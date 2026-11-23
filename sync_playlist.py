@@ -3,22 +3,43 @@
 
 from __future__ import annotations
 
-import argparse
-import csv
+import os
 from pathlib import Path
 import sys
-from typing import Any
-from rich.console import Console
-from rich.panel import Panel
-from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
-from rich.prompt import Confirm, Prompt
-from rich.table import Table
 
-from src.matcher import match_playlist_tracks
-from src.models import MatchResult, PlaylistData, Track
-from src.navidrome import NavidromeClient, SubsonicError, load_navidrome_credentials
-from src.sources.exportify_csv import parse_exportify_csv
-from src.sources.spotify_embed import fetch_spotify_embed_playlist
+# Auto-reexec using local .venv if executed with an external or system python interpreter
+_script_dir = Path(__file__).resolve().parent
+_local_venv = _script_dir / ".venv"
+_venv_python = _local_venv / "bin" / "python"
+if _venv_python.is_file() and os.access(_venv_python, os.X_OK):
+    if Path(sys.prefix).resolve() != _local_venv.resolve():
+        os.execv(str(_venv_python), [str(_venv_python)] + sys.argv)
+
+import argparse
+import csv
+from typing import Any
+
+try:
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
+    from rich.prompt import Confirm, Prompt
+    from rich.table import Table
+
+    from src.matcher import match_playlist_tracks
+    from src.models import MatchResult, PlaylistData, Track
+    from src.navidrome import NavidromeClient, SubsonicError, load_navidrome_credentials
+    from src.sources.exportify_csv import parse_exportify_csv
+    from src.sources.spotify_embed import fetch_spotify_embed_playlist
+except ImportError as _import_err:
+    print(
+        f"Error: Missing required dependency ({_import_err}).\n"
+        "Please install the dependencies in your environment or activate the project virtualenv:\n"
+        "  source .venv/bin/activate\n"
+        "  pip install -r requirements.txt\n",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
 console = Console()
 

@@ -8,25 +8,31 @@ import requests
 from src.navidrome import NavidromeClient, SubsonicError, load_navidrome_credentials
 
 
-def test_load_navidrome_credentials_valid(monkeypatch):
+def test_load_navidrome_credentials_valid(monkeypatch, tmp_path):
+    env_file = tmp_path / ".env.test"
+    env_file.write_text("NAVIDROME_URL=https://music.example.com/\nNAVIDROME_USER=admin\nNAVIDROME_PASSWORD=secret\n")
+
     monkeypatch.setenv("NAVIDROME_URL", "https://music.example.com/")
     monkeypatch.setenv("NAVIDROME_USER", "admin")
     monkeypatch.setenv("NAVIDROME_PASSWORD", "secret")
 
-    url, user, password = load_navidrome_credentials()
+    url, user, password = load_navidrome_credentials(env_file=env_file)
     # Verifies trailing slash stripped
     assert url == "https://music.example.com"
     assert user == "admin"
     assert password == "secret"
 
 
-def test_load_navidrome_credentials_missing(monkeypatch):
+def test_load_navidrome_credentials_missing(monkeypatch, tmp_path):
+    empty_env = tmp_path / ".env.empty"
+    empty_env.write_text("")
     monkeypatch.delenv("NAVIDROME_URL", raising=False)
     monkeypatch.delenv("NAVIDROME_USER", raising=False)
     monkeypatch.delenv("NAVIDROME_PASSWORD", raising=False)
 
-    with pytest.raises(ValueError, match="Missing required Navidrome environment variable"):
-        load_navidrome_credentials()
+    with patch("src.navidrome.load_dotenv"):
+        with pytest.raises(ValueError, match="Missing required Navidrome environment variable"):
+            load_navidrome_credentials(env_file=empty_env)
 
 
 def test_auth_params_subsonic_token():
