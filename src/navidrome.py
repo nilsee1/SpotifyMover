@@ -8,9 +8,10 @@ import os
 from pathlib import Path
 import secrets
 from typing import Any
-from urllib.parse import urljoin
 from dotenv import load_dotenv
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,9 @@ def load_navidrome_credentials(env_file: str | Path | None = None) -> tuple[str,
         load_dotenv(dotenv_path=env_file)
     else:
         load_dotenv()
+        project_env = Path(__file__).resolve().parent.parent / ".env"
+        if project_env.is_file():
+            load_dotenv(dotenv_path=project_env, override=False)
 
     url = os.getenv("NAVIDROME_URL")
     user = os.getenv("NAVIDROME_USER")
@@ -76,6 +80,8 @@ class NavidromeClient:
         api_version: str = "1.16.1",
         timeout: int = 15,
         session: requests.Session | None = None,
+        pool_connections: int = 16,
+        pool_maxsize: int = 16,
     ):
         self.url = url.rstrip("/")
         self.user = user
@@ -83,7 +89,24 @@ class NavidromeClient:
         self.client_name = client_name
         self.api_version = api_version
         self.timeout = timeout
-        self.session = session or requests.Session()
+
+        if session is not None:
+            self.session = session
+        else:
+            self.session = requests.Session()
+            retry_strategy = Retry(
+                total=3,
+                backoff_factor=0.5,
+                status_forcelist=[429, 500, 502, 503, 504],
+                allowed_methods=frozenset(["GET"]),
+            )
+            adapter = HTTPAdapter(
+                pool_connections=pool_connections,
+                pool_maxsize=pool_maxsize,
+                max_retries=retry_strategy,
+            )
+            self.session.mount("http://", adapter)
+            self.session.mount("https://", adapter)
 
     def _get_auth_params(self) -> dict[str, str]:
         """Generate Subsonic token authentication parameters (never sending plaintext password)."""

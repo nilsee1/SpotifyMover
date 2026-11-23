@@ -2,9 +2,11 @@
 
 import hashlib
 import json
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 import pytest
 import requests
+from requests.adapters import HTTPAdapter
 from src.navidrome import NavidromeClient, SubsonicError, load_navidrome_credentials
 
 
@@ -33,6 +35,49 @@ def test_load_navidrome_credentials_missing(monkeypatch, tmp_path):
     with patch("src.navidrome.load_dotenv"):
         with pytest.raises(ValueError, match="Missing required Navidrome environment variable"):
             load_navidrome_credentials(env_file=empty_env)
+
+
+def test_load_navidrome_credentials_project_root_fallback(monkeypatch):
+    """Verify that when env_file is None, load_dotenv is called first with None, then with project .env."""
+    calls = []
+
+    def mock_load_dotenv(dotenv_path=None, override=True):
+        calls.append((dotenv_path, override))
+        if dotenv_path is not None:
+            monkeypatch.setenv("NAVIDROME_URL", "https://navidrome.root")
+            monkeypatch.setenv("NAVIDROME_USER", "rootuser")
+            monkeypatch.setenv("NAVIDROME_PASSWORD", "rootpass")
+
+    monkeypatch.delenv("NAVIDROME_URL", raising=False)
+    monkeypatch.delenv("NAVIDROME_USER", raising=False)
+    monkeypatch.delenv("NAVIDROME_PASSWORD", raising=False)
+
+    with patch("src.navidrome.load_dotenv", side_effect=mock_load_dotenv), \
+         patch.object(Path, "is_file", return_value=True):
+        url, user, password = load_navidrome_credentials(env_file=None)
+        assert url == "https://navidrome.root"
+        assert user == "rootuser"
+        assert password == "rootpass"
+        # First call has dotenv_path=None
+        assert calls[0] == (None, True)
+        # Second call has project_env path and override=False
+        assert calls[1][1] is False
+        assert calls[1][0].name == ".env"
+
+
+def test_navidrome_client_session_retry_adapter():
+    """Verify NavidromeClient session mounts retry-enabled HTTPAdapter for GET requests."""
+    client = NavidromeClient(url="https://music.example.com", user="testuser", password="secret")
+    adapter = client.session.adapters.get("https://")
+    assert isinstance(adapter, HTTPAdapter)
+    assert adapter._pool_connections == 16
+    assert adapter._pool_maxsize == 16
+
+    retry = adapter.max_retries
+    assert retry.total == 3
+    assert retry.backoff_factor == 0.5
+    assert set(retry.status_forcelist) == {429, 500, 502, 503, 504}
+    assert retry.allowed_methods == frozenset(["GET"])
 
 
 def test_auth_params_subsonic_token():

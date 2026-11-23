@@ -8,12 +8,10 @@ import re
 from typing import Any
 import requests
 from bs4 import BeautifulSoup
-from rich.console import Console
 
 from src.models import PlaylistData, Track
 
 logger = logging.getLogger(__name__)
-console = Console()
 
 SPOTIFY_URL_REGEX = re.compile(
     r"(?:spotify:playlist:|https?://open\.spotify\.com/(?:[a-zA-Z0-9\-_]+/)*(?:embed/)?playlist/)([a-zA-Z0-9]+)"
@@ -63,18 +61,29 @@ def _parse_artists_from_item(item: dict[str, Any]) -> list[str]:
                 elif isinstance(auth, str) and auth.strip():
                     artists.append(auth.strip())
 
-    # 3. Check subtitle string (typical in embed __NEXT_DATA__)
-    subtitle = item.get("subtitle")
-    if isinstance(subtitle, str) and subtitle.strip():
-        # Replace non-breaking spaces and normalize
-        normalized = subtitle.replace("\xa0", " ").replace("\u200b", "")
-        # Split on comma or semicolon
-        split_artists = [a.strip() for a in re.split(r"[,;]+", normalized) if a.strip()]
-        for art in split_artists:
-            if art not in artists:
+    # 3. Check subtitle string (typical in embed __NEXT_DATA__) only if artists is still empty
+    if not artists:
+        subtitle = item.get("subtitle")
+        if isinstance(subtitle, str) and subtitle.strip():
+            # Replace non-breaking spaces and normalize
+            normalized = subtitle.replace("\xa0", " ").replace("\u200b", "").strip()
+            # If semicolon is present, split only on semicolon; otherwise split on comma
+            if ";" in normalized:
+                split_artists = [a.strip() for a in normalized.split(";") if a.strip()]
+            else:
+                split_artists = [a.strip() for a in normalized.split(",") if a.strip()]
+            for art in split_artists:
                 artists.append(art)
 
-    return artists
+    # Deduplicate extracted artist names while preserving order
+    seen: set[str] = set()
+    deduped_artists: list[str] = []
+    for art in artists:
+        if art not in seen:
+            seen.add(art)
+            deduped_artists.append(art)
+
+    return deduped_artists
 
 
 def parse_embed_html(html_content: str, playlist_id: str) -> PlaylistData:
@@ -156,20 +165,22 @@ def parse_embed_html(html_content: str, playlist_id: str) -> PlaylistData:
         )
 
     # 100-track warning requirement
+    warnings: list[str] = []
+    is_truncated = False
     if len(parsed_tracks) == 100:
-        console.print(
-            "\n[bold yellow]⚠ Warning: Exactly 100 tracks were retrieved from Spotify's embed endpoint.[/bold yellow]"
-        )
-        console.print(
-            "[yellow]Spotify's public embed page caps responses at 100 tracks. "
+        is_truncated = True
+        warnings.append(
+            "Spotify's public embed page caps responses at 100 tracks. "
             "For playlists with more than 100 tracks, please export the playlist to a CSV file "
-            "using Exportify (https://exportify.net) and run this tool on the CSV file.[/yellow]\n"
+            "using Exportify (https://exportify.net) and run this tool on the CSV file."
         )
 
     return PlaylistData(
         name=str(playlist_name).strip(),
         tracks=parsed_tracks,
         source_type="spotify_embed",
+        warnings=warnings,
+        is_truncated=is_truncated,
     )
 
 

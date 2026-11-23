@@ -19,13 +19,15 @@ def derive_playlist_name_from_path(file_path: str | Path) -> str:
 
 
 def _split_artist_string(artist_str: str) -> list[str]:
-    """Split multi-artist string on comma or semicolon and clean up names."""
+    """Split multi-artist string on semicolon if present, or comma fallback, and clean up names."""
     if not artist_str:
         return []
-    # Replace non-breaking spaces
+    # Replace non-breaking spaces and strip zero-width spaces
     normalized = artist_str.replace("\xa0", " ").replace("\u200b", "")
-    parts = re.split(r"[,;]+", normalized)
-    artists = [p.strip() for p in parts if p.strip()]
+    if ";" in normalized:
+        artists = [p.strip() for p in normalized.split(";") if p.strip()]
+    else:
+        artists = [p.strip() for p in normalized.split(",") if p.strip()]
     return artists
 
 
