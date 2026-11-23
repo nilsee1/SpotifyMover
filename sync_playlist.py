@@ -26,8 +26,22 @@ try:
     from rich.prompt import Confirm, Prompt
     from rich.table import Table
 
+    from src.lidarr import (
+        LidarrClient,
+        LidarrConfig,
+        LidarrError,
+        apply_lidarr_plans,
+        build_lidarr_plans,
+        load_lidarr_config,
+    )
     from src.matcher import match_playlist_tracks
-    from src.models import MatchResult, PlaylistData, Track
+    from src.models import (
+        LidarrAlbumPlan,
+        LidarrSyncSummary,
+        MatchResult,
+        PlaylistData,
+        Track,
+    )
     from src.navidrome import NavidromeClient, SubsonicError, load_navidrome_credentials
     from src.sources.exportify_csv import parse_exportify_csv
     from src.sources.spotify_embed import fetch_spotify_embed_playlist
@@ -135,6 +149,250 @@ def display_results_summary(
     return matched, unmatched
 
 
+def positive_int(val: str) -> int:
+    """Type validator for positive integers (>= 1)."""
+    try:
+        ival = int(val)
+        if ival < 1:
+            raise argparse.ArgumentTypeError(f"Value must be a positive integer >= 1 (got {val})")
+        return ival
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"Invalid positive integer: {val}")
+
+
+def parse_selection_indices(input_str: str, max_index: int) -> list[int]:
+    """Parse selection string like 'all', 'none', or '1,3-5' into 1-based indices."""
+    cleaned = input_str.strip().lower()
+    if not cleaned or cleaned == "all":
+        return list(range(1, max_index + 1))
+    if cleaned == "none":
+        return []
+
+    indices: set[int] = set()
+    parts = cleaned.split(",")
+    for part in parts:
+        p = part.strip()
+        if not p:
+            continue
+        if "-" in p:
+            sub = p.split("-")
+            if len(sub) != 2:
+                raise ValueError(f"Invalid range syntax: '{p}'")
+            try:
+                start, end = int(sub[0].strip()), int(sub[1].strip())
+            except ValueError:
+                raise ValueError(f"Non-integer value in range: '{p}'")
+            if start > end:
+                raise ValueError(f"Range start ({start}) cannot be greater than end ({end})")
+            if start < 1 or end > max_index:
+                raise ValueError(f"Range '{p}' out of bounds (1-{max_index})")
+            indices.update(range(start, end + 1))
+        else:
+            try:
+                val = int(p)
+            except ValueError:
+                raise ValueError(f"Invalid integer index: '{p}'")
+            if val < 1 or val > max_index:
+                raise ValueError(f"Index {val} out of bounds (1-{max_index})")
+            indices.add(val)
+
+    return sorted(indices)
+
+
+def display_lidarr_preview_table(plans: list[LidarrAlbumPlan], verbose: bool = False) -> None:
+    """Render a clean Rich preview table of planned Lidarr actions."""
+    table = Table(title="Lidarr Missing Albums Plan", show_header=True, header_style="bold magenta")
+    table.add_column("#", justify="right", style="dim", width=4)
+    table.add_column("Artist", style="yellow")
+    table.add_column("Album", style="white")
+    table.add_column("Missing Tracks", justify="right")
+    table.add_column("Status")
+
+    status_labels = {
+        "new_artist_and_album": "[bold green]New Artist + Album[/bold green]",
+        "existing_artist_unmonitored": "[bold cyan]Existing Artist (Monitor Album)[/bold cyan]",
+        "already_monitored": "[dim]Already Monitored[/dim]",
+        "skipped_min_tracks": "[yellow]Skipped (< min tracks)[/yellow]",
+        "not_found": "[red]Not Found[/red]",
+    }
+
+    for idx, plan in enumerate(plans, start=1):
+        artist_name = plan.resolved_artist_name or plan.group.artist
+        album_title = plan.resolved_album_title or plan.group.album or "Unknown Album"
+        status_styled = status_labels.get(plan.status, plan.status)
+
+        if verbose and plan.group.tracks:
+            titles = ", ".join(f"'{t.title}'" for t in plan.group.tracks)
+            missing_tracks_str = f"{len(plan.group.tracks)} ({titles})"
+        else:
+            missing_tracks_str = str(len(plan.group.tracks))
+
+        table.add_row(str(idx), artist_name, album_title, missing_tracks_str, status_styled)
+
+    console.print()
+    console.print(table)
+
+
+def handle_lidarr_integration(unmatched: list[MatchResult], args: argparse.Namespace) -> int:
+    """Execute Lidarr album resolution, preview, and monitoring workflow."""
+    if not unmatched:
+        console.print("[green]All tracks were matched! No missing tracks to send to Lidarr.[/green]")
+        return 0
+
+    try:
+        lidarr_config = load_lidarr_config()
+    except ValueError as exc:
+        console.print(f"[bold red]Lidarr Configuration Error:[/bold red] {exc}")
+        return 1
+
+    lidarr_client = LidarrClient(url=lidarr_config.url, api_key=lidarr_config.api_key)
+
+    console.print(f"\n[dim]Connecting to Lidarr at {lidarr_config.url}...[/dim]")
+    try:
+        lidarr_client.test_connection()
+        console.print("[green]✔ Lidarr connection verified.[/green]")
+    except Exception as exc:
+        console.print(f"[bold red]Failed to connect to Lidarr:[/] {exc}")
+        return 1
+
+    try:
+        resolved_root_folder = lidarr_client.resolve_root_folder(lidarr_config.root_folder)
+        resolved_quality_profile = lidarr_client.resolve_quality_profile(lidarr_config.quality_profile)
+        resolved_metadata_profile = lidarr_client.resolve_metadata_profile(lidarr_config.metadata_profile)
+    except ValueError as exc:
+        console.print(f"[bold red]Lidarr Profile/Folder Resolution Error:[/bold red] {exc}")
+        return 1
+
+    missing_tracks = [r.track for r in unmatched]
+    plans: list[LidarrAlbumPlan] = []
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+        TextColumn("({task.completed}/{task.total})"),
+        TimeElapsedColumn(),
+        console=console,
+    ) as progress:
+        task_id = progress.add_task("Resolving missing albums for Lidarr...", total=len(missing_tracks))
+
+        def on_lidarr_progress(completed: int, total: int, desc: str) -> None:
+            progress.update(task_id, completed=completed, description=f"[cyan]{desc}[/cyan]")
+
+        plans = build_lidarr_plans(
+            client=lidarr_client,
+            missing_tracks=missing_tracks,
+            min_tracks=args.lidarr_min_tracks,
+            progress_callback=on_lidarr_progress,
+        )
+
+    display_lidarr_preview_table(plans, verbose=args.verbose)
+
+    actionable_plans = [
+        p for p in plans if p.status in ("new_artist_and_album", "existing_artist_unmonitored")
+    ]
+
+    if not actionable_plans:
+        console.print("\n[yellow]No actionable albums to send to Lidarr.[/yellow]")
+        return 0
+
+    if args.dry_run:
+        console.print(
+            f"\n[bold cyan]ℹ Dry run: {len(actionable_plans)} album(s) would be sent to Lidarr "
+            f"(tag: '{lidarr_config.tag}'). No changes made.[/bold cyan]"
+        )
+        return 0
+
+    plans_to_apply = actionable_plans
+    if args.lidarr_select and not args.yes:
+        console.print(
+            f"\n[cyan]Enter indices or ranges of albums to send (1-{len(plans)} from table above, 'all', or 'none'):[/cyan]"
+        )
+        try:
+            choice = Prompt.ask("Selection", default="all")
+            selected_indices = set(parse_selection_indices(choice, len(plans)))
+        except (KeyboardInterrupt, EOFError):
+            console.print("\n[yellow]Operation aborted by user.[/yellow]")
+            return 0
+        except ValueError as exc:
+            console.print(f"[bold red]Selection Error:[/bold red] {exc}")
+            return 1
+
+        plans_to_apply = [
+            p for i, p in enumerate(plans, start=1)
+            if i in selected_indices and p in actionable_plans
+        ]
+
+        if not plans_to_apply:
+            console.print("[yellow]No albums selected. Lidarr sync skipped.[/yellow]")
+            return 0
+
+    if not args.yes:
+        search_desc = "yes" if args.lidarr_search else "no"
+        prompt_msg = f"Send {len(plans_to_apply)} album(s) to Lidarr (tag: '{lidarr_config.tag}', trigger search: {search_desc})?"
+        try:
+            confirmed = Confirm.ask(prompt_msg, default=False)
+        except (KeyboardInterrupt, EOFError):
+            console.print("\n[yellow]Operation aborted by user.[/yellow]")
+            return 0
+        if not confirmed:
+            console.print("[yellow]Lidarr sync cancelled by user.[/yellow]")
+            return 0
+
+    summary: LidarrSyncSummary
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+        TextColumn("({task.completed}/{task.total})"),
+        TimeElapsedColumn(),
+        console=console,
+    ) as progress:
+        apply_task = progress.add_task("Applying Lidarr plans...", total=len(plans_to_apply))
+
+        def on_apply_progress(completed: int, total: int, plan: LidarrAlbumPlan) -> None:
+            progress.advance(apply_task, 1)
+
+        summary = apply_lidarr_plans(
+            client=lidarr_client,
+            plans=plans_to_apply,
+            root_folder=resolved_root_folder,
+            quality_profile_id=resolved_quality_profile,
+            metadata_profile_id=resolved_metadata_profile,
+            tag=lidarr_config.tag,
+            trigger_search=args.lidarr_search,
+            progress_callback=on_apply_progress,
+        )
+
+    search_status = (
+        f"[green]Yes (Command ID: {summary.search_command_id})[/green]"
+        if summary.search_triggered
+        else "No"
+    )
+    summary_lines = [
+        f"[bold]New Artists Added:[/] [green]{len(summary.added_artists)}[/green]",
+        f"[bold]Albums Monitored:[/] [green]{len(summary.monitored_albums)}[/green]",
+        f"[bold]Tag Applied:[/] [cyan]{lidarr_config.tag}[/cyan] ({len(summary.tagged_artist_ids)} artist(s) tagged)",
+        f"[bold]Search Triggered:[/] {search_status}",
+    ]
+    if summary.failed:
+        summary_lines.append(f"[bold red]Errors ({len(summary.failed)}):[/bold red]")
+        for item, err in summary.failed:
+            summary_lines.append(f"  • [red]{item}:[/red] {err}")
+
+    console.print()
+    console.print(
+        Panel.fit(
+            "\n".join(summary_lines),
+            title="[bold green]Lidarr Synchronization Summary[/bold green]",
+            border_style="green" if not summary.failed else "yellow",
+        )
+    )
+    return 0
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     """Build and return command line argument parser."""
     parser = argparse.ArgumentParser(
@@ -187,6 +445,33 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--verbose",
         action="store_true",
         help="Print match score and matched Navidrome metadata for every individual track.",
+    )
+    parser.add_argument(
+        "--send-to-lidarr",
+        action="store_true",
+        help="Resolve unmatched tracks to albums and send them to Lidarr.",
+    )
+    parser.add_argument(
+        "--lidarr-search",
+        action="store_true",
+        help="Immediately trigger an AlbumSearch command in Lidarr for all newly monitored albums.",
+    )
+    parser.add_argument(
+        "--lidarr-min-tracks",
+        type=positive_int,
+        default=1,
+        help="Only send an album to Lidarr if at least N missing tracks belong to it (default: 1).",
+    )
+    parser.add_argument(
+        "--lidarr-select",
+        action="store_true",
+        help="Interactively choose which resolved albums to send to Lidarr before applying changes.",
+    )
+    parser.add_argument(
+        "--yes",
+        "-y",
+        action="store_true",
+        help="Skip interactive confirmation prompts.",
     )
     return parser
 
@@ -299,64 +584,71 @@ def main() -> int:
             console.print("[green]All tracks were matched! Nothing to export.[/green]")
 
     # 7. Apply playlist changes to Navidrome (unless dry-run)
-    if args.dry_run:
-        console.print("\n[bold cyan]ℹ Dry run mode enabled: No playlists were created or modified on Navidrome.[/bold cyan]")
-        return 0
+    if not args.dry_run:
+        if matched:
+            matched_song_ids = [str(r.navidrome_id) for r in matched if r.navidrome_id]
 
-    if not matched:
-        console.print("\n[yellow]No tracks matched. Playlist creation skipped.[/yellow]")
-        return 0
-
-    matched_song_ids = [str(r.navidrome_id) for r in matched if r.navidrome_id]
-
-    try:
-        existing_playlist = client.find_playlist_by_name(target_name)
-    except Exception as exc:
-        console.print(f"[yellow]Warning: Could not check existing playlists: {exc}[/yellow]")
-        existing_playlist = None
-
-    playlist_id_to_update: str | None = None
-
-    if existing_playlist:
-        existing_id = str(existing_playlist.get("id"))
-        existing_count = existing_playlist.get("songCount", 0)
-
-        if args.update:
-            console.print(
-                f"[cyan]Existing playlist '{target_name}' found (ID: {existing_id}, {existing_count} tracks). "
-                f"Updating (--update specified)...[/cyan]"
-            )
-            playlist_id_to_update = existing_id
-        else:
-            console.print(
-                f"\n[bold yellow]Notice: Playlist '{target_name}' already exists on Navidrome "
-                f"(ID: {existing_id}, current songs: {existing_count}).[/bold yellow]"
-            )
             try:
-                should_overwrite = Confirm.ask("Do you want to overwrite it with the matched tracks?", default=False)
-            except (KeyboardInterrupt, EOFError):
-                console.print("\n[yellow]Aborted by user.[/yellow]")
-                return 0
+                existing_playlist = client.find_playlist_by_name(target_name)
+            except Exception as exc:
+                console.print(f"[yellow]Warning: Could not check existing playlists: {exc}[/yellow]")
+                existing_playlist = None
 
-            if should_overwrite:
-                playlist_id_to_update = existing_id
-            else:
-                console.print("[yellow]Playlist sync cancelled by user (use --name to specify a different name).[/yellow]")
-                return 0
+            playlist_id_to_update: str | None = None
 
-    with console.status(f"[bold green]Saving playlist '{target_name}' to Navidrome...", spinner="dots"):
-        try:
-            client.create_or_update_playlist(
-                name=target_name,
-                song_ids=matched_song_ids,
-                playlist_id=playlist_id_to_update,
-            )
-        except Exception as exc:
-            console.print(f"[bold red]Failed to save playlist to Navidrome:[/] {exc}")
-            return 1
+            if existing_playlist:
+                existing_id = str(existing_playlist.get("id"))
+                existing_count = existing_playlist.get("songCount", 0)
 
-    action_word = "Updated" if playlist_id_to_update else "Created"
-    console.print(f"\n[bold green]✔ Successfully {action_word} playlist '{target_name}' with {len(matched_song_ids)} tracks![/bold green]")
+                if args.update or args.yes:
+                    console.print(
+                        f"[cyan]Existing playlist '{target_name}' found (ID: {existing_id}, {existing_count} tracks). "
+                        f"Updating...[/cyan]"
+                    )
+                    playlist_id_to_update = existing_id
+                else:
+                    console.print(
+                        f"\n[bold yellow]Notice: Playlist '{target_name}' already exists on Navidrome "
+                        f"(ID: {existing_id}, current songs: {existing_count}).[/bold yellow]"
+                    )
+                    try:
+                        should_overwrite = Confirm.ask("Do you want to overwrite it with the matched tracks?", default=False)
+                    except (KeyboardInterrupt, EOFError):
+                        console.print("\n[yellow]Aborted by user.[/yellow]")
+                        return 0
+
+                    if should_overwrite:
+                        playlist_id_to_update = existing_id
+                    else:
+                        console.print("[yellow]Playlist sync cancelled by user (use --name to specify a different name).[/yellow]")
+                        if not args.send_to_lidarr:
+                            return 0
+
+            if playlist_id_to_update is not None or not existing_playlist:
+                with console.status(f"[bold green]Saving playlist '{target_name}' to Navidrome...", spinner="dots"):
+                    try:
+                        client.create_or_update_playlist(
+                            name=target_name,
+                            song_ids=matched_song_ids,
+                            playlist_id=playlist_id_to_update,
+                        )
+                        action_word = "Updated" if playlist_id_to_update else "Created"
+                        console.print(f"\n[bold green]✔ Successfully {action_word} playlist '{target_name}' with {len(matched_song_ids)} tracks![/bold green]")
+                    except Exception as exc:
+                        console.print(f"[bold red]Failed to save playlist to Navidrome:[/] {exc}")
+                        if not args.send_to_lidarr:
+                            return 1
+        else:
+            console.print("\n[yellow]No tracks matched. Playlist creation skipped on Navidrome.[/yellow]")
+    else:
+        console.print("\n[bold cyan]ℹ Dry run mode enabled: No playlists were created or modified on Navidrome.[/bold cyan]")
+
+    # 8. Lidarr integration for unmatched tracks
+    if args.send_to_lidarr:
+        lidarr_ret = handle_lidarr_integration(unmatched, args)
+        if lidarr_ret != 0:
+            return lidarr_ret
+
     return 0
 
 

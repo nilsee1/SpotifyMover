@@ -1,8 +1,29 @@
-"""Unit tests for CLI utility functions."""
+"""Unit tests for CLI utility functions, argument parsing, and dry-run execution."""
 
+from __future__ import annotations
+
+import argparse
 from pathlib import Path
-from src.models import MatchResult, Track
-from sync_playlist import detect_and_load_source, export_unmatched_tracks
+from unittest import mock
+import pytest
+
+from src.lidarr import LidarrClient, LidarrConfig
+from src.models import (
+    LidarrAlbumPlan,
+    MatchResult,
+    MissingAlbumGroup,
+    PlaylistData,
+    Track,
+)
+from sync_playlist import (
+    build_arg_parser,
+    detect_and_load_source,
+    export_unmatched_tracks,
+    handle_lidarr_integration,
+    main,
+    parse_selection_indices,
+    positive_int,
+)
 
 
 def test_export_unmatched_tracks_txt(tmp_path: Path):
@@ -31,3 +52,145 @@ def test_export_unmatched_tracks_csv(tmp_path: Path):
     content = csv_file.read_text(encoding="utf-8-sig")
     assert "Artist,Title,Album,Duration (s)" in content
     assert "Artist A,Track One,Album A,210.0" in content
+
+
+# =====================================================================
+# CLI Argument Parsing Tests
+# =====================================================================
+
+def test_build_arg_parser_lidarr_flags():
+    parser = build_arg_parser()
+    args = parser.parse_args([
+        "https://open.spotify.com/playlist/test",
+        "--send-to-lidarr",
+        "--lidarr-search",
+        "--lidarr-min-tracks", "3",
+        "--lidarr-select",
+        "--yes",
+    ])
+
+    assert args.send_to_lidarr is True
+    assert args.lidarr_search is True
+    assert args.lidarr_min_tracks == 3
+    assert args.lidarr_select is True
+    assert args.yes is True
+
+
+def test_build_arg_parser_lidarr_flags_defaults():
+    parser = build_arg_parser()
+    args = parser.parse_args(["https://open.spotify.com/playlist/test"])
+
+    assert args.send_to_lidarr is False
+    assert args.lidarr_search is False
+    assert args.lidarr_min_tracks == 1
+    assert args.lidarr_select is False
+    assert args.yes is False
+
+
+def test_build_arg_parser_short_yes_flag():
+    parser = build_arg_parser()
+    args = parser.parse_args(["https://open.spotify.com/playlist/test", "-y"])
+    assert args.yes is True
+
+
+def test_positive_int_validator():
+    assert positive_int("1") == 1
+    assert positive_int("5") == 5
+
+    with pytest.raises(argparse.ArgumentTypeError, match="Value must be a positive integer >= 1"):
+        positive_int("0")
+
+    with pytest.raises(argparse.ArgumentTypeError, match="Value must be a positive integer >= 1"):
+        positive_int("-2")
+
+    with pytest.raises(argparse.ArgumentTypeError, match="Invalid positive integer"):
+        positive_int("abc")
+
+
+# =====================================================================
+# Index / Range Selection Parser Tests
+# =====================================================================
+
+def test_parse_selection_indices_valid():
+    assert parse_selection_indices("all", 5) == [1, 2, 3, 4, 5]
+    assert parse_selection_indices("", 3) == [1, 2, 3]
+    assert parse_selection_indices("none", 5) == []
+    assert parse_selection_indices("1,3-5", 5) == [1, 3, 4, 5]
+    assert parse_selection_indices("2, 4 , 1", 5) == [1, 2, 4]
+    assert parse_selection_indices("1-3, 5", 5) == [1, 2, 3, 5]
+
+
+def test_parse_selection_indices_invalid():
+    # Out of bounds
+    with pytest.raises(ValueError, match="out of bounds"):
+        parse_selection_indices("6", 5)
+
+    with pytest.raises(ValueError, match="out of bounds"):
+        parse_selection_indices("1-10", 5)
+
+    with pytest.raises(ValueError, match="out of bounds"):
+        parse_selection_indices("0", 5)
+
+    # Inverted range
+    with pytest.raises(ValueError, match="cannot be greater than end"):
+        parse_selection_indices("5-3", 5)
+
+    # Non-integer
+    with pytest.raises(ValueError, match="Invalid integer index"):
+        parse_selection_indices("foo", 5)
+
+    # Malformed range
+    with pytest.raises(ValueError, match="Invalid range syntax"):
+        parse_selection_indices("1-2-3", 5)
+
+
+# =====================================================================
+# Dry-Run Lidarr Integration Test
+# =====================================================================
+
+def test_dry_run_send_to_lidarr_skips_mutations():
+    """Verify that --dry-run with --send-to-lidarr performs lookups and preview without mutations."""
+    parser = build_arg_parser()
+    args = parser.parse_args([
+        "dummy_source",
+        "--dry-run",
+        "--send-to-lidarr",
+    ])
+
+    unmatched = [
+        MatchResult(
+            track=Track(title="Phantom", artists=["Justice"], album="†"),
+            matched=False,
+        )
+    ]
+
+    mock_cfg = LidarrConfig(url="https://lidarr.local", api_key="secret", tag="SpotifyMoverTool")
+
+    client_mock = mock.MagicMock(spec=LidarrClient)
+    client_mock.test_connection.return_value = {"status": "ok"}
+    client_mock.resolve_root_folder.return_value = "/music"
+    client_mock.resolve_quality_profile.return_value = 1
+    client_mock.resolve_metadata_profile.return_value = 1
+
+    plan = LidarrAlbumPlan(
+        group=MissingAlbumGroup(artist="Justice", album="†", tracks=[unmatched[0].track]),
+        status="new_artist_and_album",
+        resolved_artist_name="Justice",
+        resolved_album_title="†",
+    )
+
+    with mock.patch("sync_playlist.load_lidarr_config", return_value=mock_cfg):
+        with mock.patch("sync_playlist.LidarrClient", return_value=client_mock):
+            with mock.patch("sync_playlist.build_lidarr_plans", return_value=[plan]) as mock_build:
+                with mock.patch("sync_playlist.apply_lidarr_plans") as mock_apply:
+                    ret = handle_lidarr_integration(unmatched, args)
+
+                    assert ret == 0
+                    # Plan build / lookup was executed
+                    mock_build.assert_called_once()
+                    # But apply_lidarr_plans was NOT called (no POST / PUT mutations)
+                    mock_apply.assert_not_called()
+                    client_mock.add_artist.assert_not_called()
+                    client_mock.monitor_albums.assert_not_called()
+                    client_mock.ensure_tag.assert_not_called()
+                    client_mock.trigger_album_search.assert_not_called()

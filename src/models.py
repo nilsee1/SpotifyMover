@@ -57,3 +57,42 @@ class PlaylistData:
     name: str
     tracks: list[Track] = field(default_factory=list)
     source_type: str = "unknown"
+
+
+@dataclass
+class MissingAlbumGroup:
+    """Represents a group of missing tracks grouped by artist and album."""
+
+    artist: str
+    album: str | None
+    musicbrainz_release_group_id: str | None = None
+    tracks: list[Track] = field(default_factory=list)
+
+
+@dataclass
+class LidarrAlbumPlan:
+    """Represents a planned action in Lidarr for a MissingAlbumGroup."""
+
+    group: MissingAlbumGroup
+    status: str  # 'new_artist_and_album', 'existing_artist_unmonitored', 'already_monitored', 'not_found', 'skipped_min_tracks'
+    lidarr_album: dict[str, Any] | None = None
+    lidarr_artist: dict[str, Any] | None = None
+    resolved_artist_name: str | None = None
+    resolved_album_title: str | None = None
+    match_score: float = 0.0
+    reason: str | None = None
+
+
+@dataclass
+class LidarrSyncSummary:
+    """Summary of operations performed or planned during Lidarr synchronization."""
+
+    added_artists: list[str] = field(default_factory=list)
+    monitored_albums: list[str] = field(default_factory=list)
+    already_monitored: list[str] = field(default_factory=list)
+    skipped: list[str] = field(default_factory=list)
+    failed: list[tuple[str, str]] = field(default_factory=list)  # (item_name, error_message)
+    tagged_artist_ids: list[int] = field(default_factory=list)
+    search_triggered: bool = False
+    search_command_id: int | None = None
+
