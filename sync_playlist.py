@@ -17,6 +17,7 @@ if _venv_python.is_file() and os.access(_venv_python, os.X_OK):
 
 import argparse
 import csv
+import time
 from typing import Any
 
 try:
@@ -32,7 +33,9 @@ try:
         LidarrError,
         apply_lidarr_plans,
         build_lidarr_plans,
+        import_lidarr_artists,
         load_lidarr_config,
+        monitor_lidarr_albums,
     )
     from src.matcher import match_playlist_tracks
     from src.models import (
@@ -192,6 +195,17 @@ def positive_int(val: str) -> int:
         raise argparse.ArgumentTypeError(f"Invalid positive integer: {val}")
 
 
+def non_negative_int(val: str) -> int:
+    """Type validator for non-negative integers (>= 0)."""
+    try:
+        ival = int(val)
+        if ival < 0:
+            raise argparse.ArgumentTypeError(f"Value must be a non-negative integer >= 0 (got {val})")
+        return ival
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"Invalid non-negative integer: {val}")
+
+
 def parse_selection_indices(input_str: str, max_index: int) -> list[int]:
     """Parse selection string like 'all', 'none', or '1,3-5' into 1-based indices."""
     cleaned = input_str.strip().lower()
@@ -263,6 +277,34 @@ def display_lidarr_preview_table(plans: list[LidarrAlbumPlan], verbose: bool = F
 
     console.print()
     console.print(table)
+
+
+def display_lidarr_summary(summary: LidarrSyncSummary, tag: str) -> None:
+    """Render a clean summary panel of the Lidarr synchronization results."""
+    search_status = (
+        f"[green]Yes (Command ID: {summary.search_command_id})[/green]"
+        if summary.search_triggered
+        else "No"
+    )
+    summary_lines = [
+        f"[bold]New Artists Added:[/] [green]{len(summary.added_artists)}[/green]",
+        f"[bold]Albums Monitored:[/] [green]{len(summary.monitored_albums)}[/green]",
+        f"[bold]Tag Applied:[/] [cyan]{tag}[/cyan] ({len(summary.tagged_artist_ids)} artist(s) tagged)",
+        f"[bold]Search Triggered:[/] {search_status}",
+    ]
+    if summary.failed:
+        summary_lines.append(f"[bold red]Errors ({len(summary.failed)}):[/bold red]")
+        for item, err in summary.failed:
+            summary_lines.append(f"  • [red]{item}:[/red] {err}")
+
+    console.print()
+    console.print(
+        Panel.fit(
+            "\n".join(summary_lines),
+            title="[bold green]Lidarr Synchronization Summary[/bold green]",
+            border_style="green" if not summary.failed else "yellow",
+        )
+    )
 
 
 def handle_lidarr_integration(unmatched: list[MatchResult], args: argparse.Namespace) -> int:
@@ -372,7 +414,8 @@ def handle_lidarr_integration(unmatched: list[MatchResult], args: argparse.Names
             console.print("[yellow]Lidarr sync cancelled by user.[/yellow]")
             return 0
 
-    summary: LidarrSyncSummary
+    # Phase 1: Import artists into Lidarr (monitoring: none) and tag artists
+    console.print("\n[bold cyan]Phase 1: Importing artists to Lidarr (monitoring: none)...[/bold cyan]")
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
@@ -382,46 +425,84 @@ def handle_lidarr_integration(unmatched: list[MatchResult], args: argparse.Names
         TimeElapsedColumn(),
         console=console,
     ) as progress:
-        apply_task = progress.add_task("Applying Lidarr plans...", total=len(plans_to_apply))
+        import_task = progress.add_task("Importing artists...", total=len(plans_to_apply))
 
-        def on_apply_progress(completed: int, total: int, plan: LidarrAlbumPlan) -> None:
-            progress.advance(apply_task, 1)
+        def on_import_progress(completed: int, total: int, plan: LidarrAlbumPlan) -> None:
+            progress.advance(import_task, 1)
 
-        summary = apply_lidarr_plans(
+        summary, new_artists_count = import_lidarr_artists(
             client=lidarr_client,
             plans=plans_to_apply,
             root_folder=resolved_root_folder,
             quality_profile_id=resolved_quality_profile,
             metadata_profile_id=resolved_metadata_profile,
             tag=lidarr_config.tag,
+            progress_callback=on_import_progress,
+        )
+
+    if new_artists_count > 0:
+        console.print(
+            f"\n[green]✔ {new_artists_count} new artist(s) added to Lidarr with monitoring disabled.[/green]"
+        )
+        console.print(
+            "[cyan]ℹ Lidarr is now fetching metadata and album discographies from MusicBrainz in the background.[/cyan]"
+        )
+        console.print(
+            "[dim]Tip: Check your Lidarr UI (Activity -> Tasks or Artist page). Once the albums appear, confirm below to monitor them.[/dim]"
+        )
+    else:
+        console.print("\n[cyan]✔ Artist checks and tagging completed (all artists already exist in Lidarr).[/cyan]")
+
+    # Optional delay
+    delay_sec = getattr(args, "lidarr_delay", 0)
+    if delay_sec > 0:
+        console.print(f"[dim]Waiting {delay_sec} second(s) (--lidarr-delay)...[/dim]")
+        time.sleep(delay_sec)
+
+    # Abfrage an User, ob alles bereit ist
+    if not args.yes:
+        ready_prompt = "Are the artists ready in Lidarr to proceed with monitoring albums?"
+        try:
+            is_ready = Confirm.ask(ready_prompt, default=True)
+        except (KeyboardInterrupt, EOFError):
+            console.print("\n[yellow]Operation aborted by user.[/yellow]")
+            return 0
+
+        if not is_ready:
+            console.print(
+                "\n[yellow]Album monitoring cancelled by user. Artists remain in Lidarr with monitoring disabled.[/yellow]"
+            )
+            display_lidarr_summary(summary, lidarr_config.tag)
+            return 0
+
+    # Phase 2: Monitor albums
+    console.print("\n[bold cyan]Phase 2: Setting target albums to monitored...[/bold cyan]")
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+        TextColumn("({task.completed}/{task.total})"),
+        TimeElapsedColumn(),
+        console=console,
+    ) as progress:
+        monitor_task = progress.add_task("Monitoring albums...", total=len(plans_to_apply))
+
+        def on_monitor_progress(completed: int, total: int, plan: LidarrAlbumPlan) -> None:
+            progress.advance(monitor_task, 1)
+
+        summary = monitor_lidarr_albums(
+            client=lidarr_client,
+            plans=plans_to_apply,
+            root_folder=resolved_root_folder,
+            quality_profile_id=resolved_quality_profile,
+            metadata_profile_id=resolved_metadata_profile,
+            summary=summary,
             trigger_search=args.lidarr_search,
-            progress_callback=on_apply_progress,
+            progress_callback=on_monitor_progress,
         )
 
-    search_status = (
-        f"[green]Yes (Command ID: {summary.search_command_id})[/green]"
-        if summary.search_triggered
-        else "No"
-    )
-    summary_lines = [
-        f"[bold]New Artists Added:[/] [green]{len(summary.added_artists)}[/green]",
-        f"[bold]Albums Monitored:[/] [green]{len(summary.monitored_albums)}[/green]",
-        f"[bold]Tag Applied:[/] [cyan]{lidarr_config.tag}[/cyan] ({len(summary.tagged_artist_ids)} artist(s) tagged)",
-        f"[bold]Search Triggered:[/] {search_status}",
-    ]
-    if summary.failed:
-        summary_lines.append(f"[bold red]Errors ({len(summary.failed)}):[/bold red]")
-        for item, err in summary.failed:
-            summary_lines.append(f"  • [red]{item}:[/red] {err}")
-
-    console.print()
-    console.print(
-        Panel.fit(
-            "\n".join(summary_lines),
-            title="[bold green]Lidarr Synchronization Summary[/bold green]",
-            border_style="green" if not summary.failed else "yellow",
-        )
-    )
+    display_lidarr_summary(summary, lidarr_config.tag)
     return 0
 
 
@@ -504,6 +585,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--lidarr-select",
         action="store_true",
         help="Interactively choose which resolved albums to send to Lidarr before applying changes.",
+    )
+    parser.add_argument(
+        "--lidarr-delay",
+        type=non_negative_int,
+        default=0,
+        help="Optional delay in seconds before monitoring albums after artist import (useful in non-interactive runs).",
     )
     parser.add_argument(
         "--yes",

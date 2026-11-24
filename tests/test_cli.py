@@ -23,6 +23,7 @@ from sync_playlist import (
     export_unmatched_tracks,
     handle_lidarr_integration,
     main,
+    non_negative_int,
     parse_selection_indices,
     parse_threshold,
     parse_workers,
@@ -279,3 +280,212 @@ def test_dry_run_send_to_lidarr_skips_mutations():
                     client_mock.monitor_albums.assert_not_called()
                     client_mock.ensure_tag.assert_not_called()
                     client_mock.trigger_album_search.assert_not_called()
+
+
+# =====================================================================
+# Two-Phase Lidarr Integration CLI Tests
+# =====================================================================
+
+def test_non_negative_int_validator():
+    assert non_negative_int("0") == 0
+    assert non_negative_int("15") == 15
+
+    with pytest.raises(argparse.ArgumentTypeError, match="Value must be a non-negative integer >= 0"):
+        non_negative_int("-1")
+
+    with pytest.raises(argparse.ArgumentTypeError, match="Invalid non-negative integer"):
+        non_negative_int("abc")
+
+
+def test_build_arg_parser_lidarr_delay_flag():
+    parser = build_arg_parser()
+    args_default = parser.parse_args(["https://open.spotify.com/playlist/test"])
+    assert args_default.lidarr_delay == 0
+
+    args_custom = parser.parse_args(["https://open.spotify.com/playlist/test", "--lidarr-delay", "12"])
+    assert args_custom.lidarr_delay == 12
+
+
+def test_handle_lidarr_integration_user_confirms_ready():
+    """Verify that when user confirms ready at prompt, both Phase 1 and Phase 2 run."""
+    parser = build_arg_parser()
+    args = parser.parse_args(["dummy_source", "--send-to-lidarr"])
+
+    unmatched = [
+        MatchResult(track=Track(title="Track 1", artists=["Artist A"], album="Album A"), matched=False)
+    ]
+    mock_cfg = LidarrConfig(url="https://lidarr.local", api_key="secret", tag="SpotifyMoverTool")
+
+    client_mock = mock.MagicMock(spec=LidarrClient)
+    client_mock.test_connection.return_value = {"status": "ok"}
+    client_mock.resolve_root_folder.return_value = "/music"
+    client_mock.resolve_quality_profile.return_value = 1
+    client_mock.resolve_metadata_profile.return_value = 1
+
+    plan = LidarrAlbumPlan(
+        group=MissingAlbumGroup(artist="Artist A", album="Album A", tracks=[unmatched[0].track]),
+        status="new_artist_and_album",
+        resolved_artist_name="Artist A",
+        resolved_album_title="Album A",
+    )
+
+    summary_phase1 = mock.MagicMock()
+    summary_phase1.added_artists = ["Artist A"]
+
+    summary_phase2 = mock.MagicMock()
+    summary_phase2.added_artists = ["Artist A"]
+    summary_phase2.monitored_albums = ["Artist A - Album A"]
+    summary_phase2.failed = []
+    summary_phase2.tagged_artist_ids = [10]
+    summary_phase2.search_triggered = False
+
+    with mock.patch("sync_playlist.load_lidarr_config", return_value=mock_cfg), \
+         mock.patch("sync_playlist.LidarrClient", return_value=client_mock), \
+         mock.patch("sync_playlist.build_lidarr_plans", return_value=[plan]), \
+         mock.patch("sync_playlist.Confirm.ask", side_effect=[True, True]) as mock_confirm, \
+         mock.patch("sync_playlist.import_lidarr_artists", return_value=(summary_phase1, 1)) as mock_import, \
+         mock.patch("sync_playlist.monitor_lidarr_albums", return_value=summary_phase2) as mock_monitor:
+
+        ret = handle_lidarr_integration(unmatched, args)
+
+        assert ret == 0
+        assert mock_confirm.call_count == 2
+        mock_import.assert_called_once()
+        mock_monitor.assert_called_once()
+
+
+def test_handle_lidarr_integration_user_cancels_monitoring():
+    """Verify that when user says 'No' to ready prompt, Phase 2 is skipped and artists stay imported."""
+    parser = build_arg_parser()
+    args = parser.parse_args(["dummy_source", "--send-to-lidarr"])
+
+    unmatched = [
+        MatchResult(track=Track(title="Track 1", artists=["Artist A"], album="Album A"), matched=False)
+    ]
+    mock_cfg = LidarrConfig(url="https://lidarr.local", api_key="secret", tag="SpotifyMoverTool")
+
+    client_mock = mock.MagicMock(spec=LidarrClient)
+    client_mock.test_connection.return_value = {"status": "ok"}
+    client_mock.resolve_root_folder.return_value = "/music"
+    client_mock.resolve_quality_profile.return_value = 1
+    client_mock.resolve_metadata_profile.return_value = 1
+
+    plan = LidarrAlbumPlan(
+        group=MissingAlbumGroup(artist="Artist A", album="Album A", tracks=[unmatched[0].track]),
+        status="new_artist_and_album",
+        resolved_artist_name="Artist A",
+        resolved_album_title="Album A",
+    )
+
+    summary_phase1 = mock.MagicMock()
+    summary_phase1.added_artists = ["Artist A"]
+    summary_phase1.monitored_albums = []
+    summary_phase1.failed = []
+    summary_phase1.tagged_artist_ids = [10]
+    summary_phase1.search_triggered = False
+
+    # First confirm (send to lidarr?): True. Second confirm (ready to monitor?): False.
+    with mock.patch("sync_playlist.load_lidarr_config", return_value=mock_cfg), \
+         mock.patch("sync_playlist.LidarrClient", return_value=client_mock), \
+         mock.patch("sync_playlist.build_lidarr_plans", return_value=[plan]), \
+         mock.patch("sync_playlist.Confirm.ask", side_effect=[True, False]), \
+         mock.patch("sync_playlist.import_lidarr_artists", return_value=(summary_phase1, 1)) as mock_import, \
+         mock.patch("sync_playlist.monitor_lidarr_albums") as mock_monitor:
+
+        ret = handle_lidarr_integration(unmatched, args)
+
+        assert ret == 0
+        mock_import.assert_called_once()
+        # Phase 2 was NOT called
+        mock_monitor.assert_not_called()
+
+
+def test_handle_lidarr_integration_yes_flag_skips_prompts():
+    """Verify that with --yes, both phases run without asking user prompts."""
+    parser = build_arg_parser()
+    args = parser.parse_args(["dummy_source", "--send-to-lidarr", "--yes"])
+
+    unmatched = [
+        MatchResult(track=Track(title="Track 1", artists=["Artist A"], album="Album A"), matched=False)
+    ]
+    mock_cfg = LidarrConfig(url="https://lidarr.local", api_key="secret", tag="SpotifyMoverTool")
+
+    client_mock = mock.MagicMock(spec=LidarrClient)
+    client_mock.test_connection.return_value = {"status": "ok"}
+    client_mock.resolve_root_folder.return_value = "/music"
+    client_mock.resolve_quality_profile.return_value = 1
+    client_mock.resolve_metadata_profile.return_value = 1
+
+    plan = LidarrAlbumPlan(
+        group=MissingAlbumGroup(artist="Artist A", album="Album A", tracks=[unmatched[0].track]),
+        status="new_artist_and_album",
+        resolved_artist_name="Artist A",
+        resolved_album_title="Album A",
+    )
+
+    summary_phase1 = mock.MagicMock()
+    summary_phase1.added_artists = ["Artist A"]
+
+    summary_phase2 = mock.MagicMock()
+    summary_phase2.added_artists = ["Artist A"]
+    summary_phase2.monitored_albums = ["Artist A - Album A"]
+    summary_phase2.failed = []
+    summary_phase2.tagged_artist_ids = [10]
+    summary_phase2.search_triggered = False
+
+    with mock.patch("sync_playlist.load_lidarr_config", return_value=mock_cfg), \
+         mock.patch("sync_playlist.LidarrClient", return_value=client_mock), \
+         mock.patch("sync_playlist.build_lidarr_plans", return_value=[plan]), \
+         mock.patch("sync_playlist.Confirm.ask") as mock_confirm, \
+         mock.patch("sync_playlist.import_lidarr_artists", return_value=(summary_phase1, 1)) as mock_import, \
+         mock.patch("sync_playlist.monitor_lidarr_albums", return_value=summary_phase2) as mock_monitor:
+
+        ret = handle_lidarr_integration(unmatched, args)
+
+        assert ret == 0
+        mock_confirm.assert_not_called()
+        mock_import.assert_called_once()
+        mock_monitor.assert_called_once()
+
+
+def test_handle_lidarr_integration_observes_delay():
+    """Verify that --lidarr-delay triggers time.sleep before Phase 2."""
+    parser = build_arg_parser()
+    args = parser.parse_args(["dummy_source", "--send-to-lidarr", "--yes", "--lidarr-delay", "10"])
+
+    unmatched = [
+        MatchResult(track=Track(title="Track 1", artists=["Artist A"], album="Album A"), matched=False)
+    ]
+    mock_cfg = LidarrConfig(url="https://lidarr.local", api_key="secret", tag="SpotifyMoverTool")
+
+    client_mock = mock.MagicMock(spec=LidarrClient)
+    client_mock.test_connection.return_value = {"status": "ok"}
+    client_mock.resolve_root_folder.return_value = "/music"
+    client_mock.resolve_quality_profile.return_value = 1
+    client_mock.resolve_metadata_profile.return_value = 1
+
+    plan = LidarrAlbumPlan(
+        group=MissingAlbumGroup(artist="Artist A", album="Album A", tracks=[unmatched[0].track]),
+        status="new_artist_and_album",
+        resolved_artist_name="Artist A",
+        resolved_album_title="Album A",
+    )
+
+    summary = mock.MagicMock()
+    summary.added_artists = ["Artist A"]
+    summary.monitored_albums = ["Artist A - Album A"]
+    summary.failed = []
+    summary.tagged_artist_ids = [10]
+    summary.search_triggered = False
+
+    with mock.patch("sync_playlist.load_lidarr_config", return_value=mock_cfg), \
+         mock.patch("sync_playlist.LidarrClient", return_value=client_mock), \
+         mock.patch("sync_playlist.build_lidarr_plans", return_value=[plan]), \
+         mock.patch("sync_playlist.import_lidarr_artists", return_value=(summary, 1)), \
+         mock.patch("sync_playlist.monitor_lidarr_albums", return_value=summary), \
+         mock.patch("sync_playlist.time.sleep") as mock_sleep:
+
+        ret = handle_lidarr_integration(unmatched, args)
+
+        assert ret == 0
+        mock_sleep.assert_called_once_with(10)

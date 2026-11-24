@@ -614,29 +614,25 @@ def build_lidarr_plans(
     return plans
 
 
-def apply_lidarr_plans(
+def import_lidarr_artists(
     client: LidarrClient,
     plans: list[LidarrAlbumPlan],
     root_folder: str,
     quality_profile_id: int,
     metadata_profile_id: int,
     tag: str = "SpotifyMoverTool",
-    trigger_search: bool = False,
     progress_callback: Callable[[int, int, LidarrAlbumPlan], None] | None = None,
-) -> LidarrSyncSummary:
-    """Safely apply approved Lidarr plans without downloading full discographies.
+) -> tuple[LidarrSyncSummary, int]:
+    """Phase 1: Import new artists into Lidarr (with monitor=none) and ensure artists are tagged.
 
-    - Adds missing artists with monitor=none and searchForMissingAlbums=False.
-    - Tags artists with the configured tag (preserving pre-existing tags).
-    - Monitored albums are explicitly updated via PUT /api/v1/album/monitor.
-    - Optional single batched AlbumSearch command triggered at the end.
+    Returns:
+        tuple[LidarrSyncSummary, int]: (Summary object tracking added artists/tags, count of new artists added).
     """
     summary = LidarrSyncSummary()
     tag_id = client.ensure_tag(tag)
 
     created_artists_by_mbid: dict[str, dict[str, Any]] = {}
-    monitored_album_ids: list[int] = []
-
+    created_artists_by_name: dict[str, dict[str, Any]] = {}
     total_plans = len(plans)
 
     for idx, plan in enumerate(plans, start=1):
@@ -664,14 +660,21 @@ def apply_lidarr_plans(
                 progress_callback(idx, total_plans, plan)
             continue
 
-        # Case A: New Artist and Album
         if plan.status == "new_artist_and_album":
             try:
                 artist_meta = plan.lidarr_artist or (plan.lidarr_album or {}).get("artist") or {}
                 foreign_artist_id = artist_meta.get("foreignArtistId")
+                artist_name = (
+                    artist_meta.get("artistName")
+                    or plan.resolved_artist_name
+                    or plan.group.artist
+                )
+                norm_name = normalize_artist(artist_name)
 
                 if foreign_artist_id and str(foreign_artist_id) in created_artists_by_mbid:
                     artist = created_artists_by_mbid[str(foreign_artist_id)]
+                elif norm_name in created_artists_by_name:
+                    artist = created_artists_by_name[norm_name]
                 else:
                     if not artist_meta.get("artistName") and foreign_artist_id:
                         looked_up = client.lookup_artist(f"lidarr:{foreign_artist_id}")
@@ -691,18 +694,91 @@ def apply_lidarr_plans(
                     artist = client.add_artist(artist_payload)
                     if foreign_artist_id:
                         created_artists_by_mbid[str(foreign_artist_id)] = artist
+                    created_artists_by_name[norm_name] = artist
 
-                    artist_name = artist.get("artistName", plan.resolved_artist_name or "Unknown Artist")
-                    summary.added_artists.append(artist_name)
+                    created_name = artist.get("artistName", artist_name)
+                    if created_name not in summary.added_artists:
+                        summary.added_artists.append(created_name)
                     if artist.get("id") and artist["id"] not in summary.tagged_artist_ids:
                         summary.tagged_artist_ids.append(artist["id"])
 
-                artist_id = artist["id"]
-                target_album_mbid = (plan.lidarr_album or {}).get("foreignAlbumId")
-                target_album_id: int | None = None
+                plan.lidarr_artist = artist
 
-                # Locate target album under artist
-                albums = client.get_artist_albums(artist_id)
+            except Exception as exc:
+                logger.error("Failed to add new artist '%s': %s", plan.resolved_artist_name or plan.group.artist, exc)
+                summary.failed.append(
+                    (f"{plan.resolved_artist_name or plan.group.artist}", str(exc))
+                )
+
+        elif plan.status == "existing_artist_unmonitored":
+            try:
+                existing_artist = plan.lidarr_artist or {}
+                artist_id = existing_artist.get("id")
+                if artist_id:
+                    client.ensure_artist_tagged(existing_artist, tag_id)
+                    if artist_id not in summary.tagged_artist_ids:
+                        summary.tagged_artist_ids.append(artist_id)
+            except Exception as exc:
+                logger.error("Failed to tag existing artist '%s': %s", plan.resolved_artist_name or plan.group.artist, exc)
+                summary.failed.append(
+                    (f"{plan.resolved_artist_name or plan.group.artist}", str(exc))
+                )
+
+        if progress_callback:
+            progress_callback(idx, total_plans, plan)
+
+    return summary, len(summary.added_artists)
+
+
+def monitor_lidarr_albums(
+    client: LidarrClient,
+    plans: list[LidarrAlbumPlan],
+    root_folder: str,
+    quality_profile_id: int,
+    metadata_profile_id: int,
+    summary: LidarrSyncSummary | None = None,
+    trigger_search: bool = False,
+    album_lookup_retries: int = 5,
+    album_lookup_delay: float = 2.0,
+    progress_callback: Callable[[int, int, LidarrAlbumPlan], None] | None = None,
+) -> LidarrSyncSummary:
+    """Phase 2: Locate target albums under artists, set them to monitored, and trigger optional search."""
+    if summary is None:
+        summary = LidarrSyncSummary()
+
+    monitored_album_ids: list[int] = []
+    artist_albums_cache: dict[int, list[dict[str, Any]]] = {}
+
+    def fetch_albums(artist_id: int, force_refresh: bool = False) -> list[dict[str, Any]]:
+        if force_refresh or artist_id not in artist_albums_cache:
+            artist_albums_cache[artist_id] = client.get_artist_albums(artist_id)
+        return artist_albums_cache[artist_id]
+
+    actionable_plans = [
+        p for p in plans if p.status in ("new_artist_and_album", "existing_artist_unmonitored")
+    ]
+    total_plans = len(actionable_plans)
+
+    for idx, plan in enumerate(actionable_plans, start=1):
+        artist_obj = plan.lidarr_artist or (plan.lidarr_album or {}).get("artist") or {}
+        artist_id = artist_obj.get("id")
+        artist_name = artist_obj.get("artistName", plan.resolved_artist_name or plan.group.artist)
+
+        if not artist_id:
+            summary.failed.append(
+                (f"{artist_name} - {plan.resolved_album_title or plan.group.album}", "Artist ID missing")
+            )
+            if progress_callback:
+                progress_callback(idx, total_plans, plan)
+            continue
+
+        target_album_mbid = (plan.lidarr_album or {}).get("foreignAlbumId")
+        target_album_id: int | None = (plan.lidarr_album or {}).get("id") if plan.status == "existing_artist_unmonitored" else None
+
+        try:
+            if not target_album_id:
+                # 1. Check existing albums for artist
+                albums = fetch_albums(artist_id, force_refresh=False)
                 for alb in albums:
                     if target_album_mbid and alb.get("foreignAlbumId") == target_album_mbid:
                         target_album_id = alb.get("id")
@@ -711,11 +787,11 @@ def apply_lidarr_plans(
                         target_album_id = alb.get("id")
                         break
 
-                # Handle Lidarr async metadata population quirk if album not listed yet
-                if not target_album_id:
-                    for _ in range(3):
-                        time.sleep(1.5)
-                        albums = client.get_artist_albums(artist_id)
+                # 2. If not found, retry with delay (Lidarr may still be fetching metadata from MusicBrainz)
+                if not target_album_id and album_lookup_retries > 0:
+                    for _ in range(album_lookup_retries):
+                        time.sleep(album_lookup_delay)
+                        albums = fetch_albums(artist_id, force_refresh=True)
                         for alb in albums:
                             if target_album_mbid and alb.get("foreignAlbumId") == target_album_mbid:
                                 target_album_id = alb.get("id")
@@ -726,89 +802,46 @@ def apply_lidarr_plans(
                         if target_album_id:
                             break
 
-                # If still not found, add album explicitly
+                # 3. Fallback: explicitly add the album via client.add_album with complete artist config
                 if not target_album_id and plan.lidarr_album:
                     album_payload = dict(plan.lidarr_album)
                     album_payload["artistId"] = artist_id
                     album_payload["monitored"] = True
                     album_payload["addOptions"] = {"searchForNewAlbum": False}
+
+                    # Populate nested artist model with valid values to satisfy Lidarr's FluentValidation
+                    nested_artist = dict(plan.lidarr_artist or album_payload.get("artist") or {})
+                    nested_artist["rootFolderPath"] = root_folder
+                    nested_artist["qualityProfileId"] = quality_profile_id
+                    nested_artist["metadataProfileId"] = metadata_profile_id
+                    if "foreignArtistId" not in nested_artist and "foreignArtistId" in (plan.lidarr_artist or {}):
+                        nested_artist["foreignArtistId"] = plan.lidarr_artist["foreignArtistId"]
+                    album_payload["artist"] = nested_artist
+
                     added_album = client.add_album(album_payload)
                     target_album_id = added_album.get("id")
 
-                if target_album_id:
-                    client.monitor_albums([target_album_id], monitored=True)
-                    monitored_album_ids.append(target_album_id)
-                    summary.monitored_albums.append(
-                        f"{plan.resolved_artist_name or artist.get('artistName')} - {plan.resolved_album_title}"
-                    )
-                else:
-                    raise LidarrError(
-                        f"Could not locate or add album '{plan.resolved_album_title}' for newly added artist '{artist.get('artistName')}'"
-                    )
-
-            except Exception as exc:
-                logger.error("Failed to add new artist and album '%s': %s", plan.resolved_album_title, exc)
-                summary.failed.append(
-                    (f"{plan.resolved_artist_name or plan.group.artist} - {plan.resolved_album_title or plan.group.album}", str(exc))
+            if target_album_id:
+                client.monitor_albums([target_album_id], monitored=True)
+                monitored_album_ids.append(target_album_id)
+                summary.monitored_albums.append(
+                    f"{artist_name} - {plan.resolved_album_title}"
+                )
+            else:
+                raise LidarrError(
+                    f"Could not locate or add album '{plan.resolved_album_title}' for artist '{artist_name}'"
                 )
 
-        # Case B: Existing Artist, Unmonitored Album
-        elif plan.status == "existing_artist_unmonitored":
-            try:
-                existing_artist = plan.lidarr_artist or {}
-                artist_id = existing_artist.get("id")
-                if not artist_id:
-                    raise LidarrError(f"Existing artist ID missing in plan for '{plan.resolved_artist_name}'")
-
-                target_album_mbid = (plan.lidarr_album or {}).get("foreignAlbumId")
-                target_album_id = (plan.lidarr_album or {}).get("id")
-
-                if not target_album_id:
-                    albums = client.get_artist_albums(artist_id)
-                    for alb in albums:
-                        if target_album_mbid and alb.get("foreignAlbumId") == target_album_mbid:
-                            target_album_id = alb.get("id")
-                            break
-                        if normalize_title(alb.get("title", "")) == normalize_title(plan.resolved_album_title or ""):
-                            target_album_id = alb.get("id")
-                            break
-
-                # Album not present on existing artist (e.g. Single/EP) -> add explicitly
-                if not target_album_id and plan.lidarr_album:
-                    album_payload = dict(plan.lidarr_album)
-                    album_payload["artistId"] = artist_id
-                    album_payload["monitored"] = True
-                    album_payload["addOptions"] = {"searchForNewAlbum": False}
-                    added_album = client.add_album(album_payload)
-                    target_album_id = added_album.get("id")
-
-                if target_album_id:
-                    client.monitor_albums([target_album_id], monitored=True)
-                    monitored_album_ids.append(target_album_id)
-
-                    # Ensure existing artist has tag_id without overwriting existing tags
-                    client.ensure_artist_tagged(existing_artist, tag_id)
-                    if artist_id not in summary.tagged_artist_ids:
-                        summary.tagged_artist_ids.append(artist_id)
-
-                    summary.monitored_albums.append(
-                        f"{plan.resolved_artist_name or existing_artist.get('artistName')} - {plan.resolved_album_title}"
-                    )
-                else:
-                    raise LidarrError(
-                        f"Could not locate or add album '{plan.resolved_album_title}' for existing artist '{existing_artist.get('artistName')}'"
-                    )
-
-            except Exception as exc:
-                logger.error("Failed to monitor album for existing artist '%s': %s", plan.resolved_album_title, exc)
-                summary.failed.append(
-                    (f"{plan.resolved_artist_name or plan.group.artist} - {plan.resolved_album_title or plan.group.album}", str(exc))
-                )
+        except Exception as exc:
+            logger.error("Failed to monitor album '%s' for artist '%s': %s", plan.resolved_album_title, artist_name, exc)
+            summary.failed.append(
+                (f"{artist_name} - {plan.resolved_album_title or plan.group.album}", str(exc))
+            )
 
         if progress_callback:
             progress_callback(idx, total_plans, plan)
 
-    # Step 4: Optional batched search trigger
+    # Batched search trigger
     if trigger_search and monitored_album_ids:
         try:
             cmd = client.trigger_album_search(monitored_album_ids)
@@ -820,3 +853,45 @@ def apply_lidarr_plans(
             summary.failed.append(("Lidarr AlbumSearch Command", str(exc)))
 
     return summary
+
+
+def apply_lidarr_plans(
+    client: LidarrClient,
+    plans: list[LidarrAlbumPlan],
+    root_folder: str,
+    quality_profile_id: int,
+    metadata_profile_id: int,
+    tag: str = "SpotifyMoverTool",
+    trigger_search: bool = False,
+    album_lookup_retries: int = 3,
+    album_lookup_delay: float = 1.5,
+    progress_callback: Callable[[int, int, LidarrAlbumPlan], None] | None = None,
+) -> LidarrSyncSummary:
+    """Safely apply approved Lidarr plans without downloading full discographies.
+
+    - Phase 1: Adds missing artists with monitor=none and searchForMissingAlbums=False,
+      and tags artists with the configured tag (preserving pre-existing tags).
+    - Phase 2: Resolves target albums under artists and sets them to monitored
+      via PUT /api/v1/album/monitor.
+    - Optional single batched AlbumSearch command triggered at the end.
+    """
+    summary, _ = import_lidarr_artists(
+        client=client,
+        plans=plans,
+        root_folder=root_folder,
+        quality_profile_id=quality_profile_id,
+        metadata_profile_id=metadata_profile_id,
+        tag=tag,
+    )
+    return monitor_lidarr_albums(
+        client=client,
+        plans=plans,
+        root_folder=root_folder,
+        quality_profile_id=quality_profile_id,
+        metadata_profile_id=metadata_profile_id,
+        summary=summary,
+        trigger_search=trigger_search,
+        album_lookup_retries=album_lookup_retries,
+        album_lookup_delay=album_lookup_delay,
+        progress_callback=progress_callback,
+    )
