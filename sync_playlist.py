@@ -103,6 +103,28 @@ def export_unmatched_tracks(unmatched_results: list[MatchResult], export_path: s
     console.print(f"[green]✔ Exported {len(unmatched_results)} unmatched tracks to:[/] {target_path}")
 
 
+def parse_threshold(value_str: str) -> int:
+    """Validate that threshold is an integer between 0 and 100."""
+    try:
+        val = int(value_str)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"Threshold must be an integer, got '{value_str}'")
+    if not (0 <= val <= 100):
+        raise argparse.ArgumentTypeError(f"Threshold must be between 0 and 100, got {val}")
+    return val
+
+
+def parse_workers(value_str: str) -> int:
+    """Validate that workers is an integer >= 1."""
+    try:
+        val = int(value_str)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"Workers must be an integer, got '{value_str}'")
+    if val < 1:
+        raise argparse.ArgumentTypeError(f"Workers must be at least 1, got {val}")
+    return val
+
+
 def display_results_summary(
     playlist_name: str,
     results: list[MatchResult],
@@ -139,10 +161,20 @@ def display_results_summary(
         missing_table.add_column("Artist", style="yellow")
         missing_table.add_column("Title", style="white")
         missing_table.add_column("Best Candidate Score", justify="right", style="dim")
+        if verbose:
+            missing_table.add_column("Best Candidate", style="dim")
 
         for idx, res in enumerate(unmatched, start=1):
             score_str = f"{res.score:.1f}%" if res.score > 0 else "N/A"
-            missing_table.add_row(str(idx), res.track.artist_display, res.track.title, score_str)
+            if verbose:
+                cand_str = (
+                    f"{res.matched_song.get('artist', 'Unknown')} - {res.matched_song.get('title', 'Unknown')}"
+                    if res.matched_song
+                    else "None"
+                )
+                missing_table.add_row(str(idx), res.track.artist_display, res.track.title, score_str, cand_str)
+            else:
+                missing_table.add_row(str(idx), res.track.artist_display, res.track.title, score_str)
 
         console.print(missing_table)
 
@@ -420,9 +452,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--threshold",
-        type=int,
+        type=parse_threshold,
         default=80,
         help="Fuzzy match threshold from 0 to 100 (default: 80).",
+    )
+    parser.add_argument(
+        "--workers",
+        type=parse_workers,
+        default=4,
+        help="Number of concurrent worker threads for matching (default: 4).",
     )
     parser.add_argument(
         "--update",
@@ -520,6 +558,10 @@ def main() -> int:
         console.print(f"[bold red]Failed to parse playlist source:[/] {exc}")
         return 1
 
+    if playlist_data.warnings:
+        for w in playlist_data.warnings:
+            console.print(f"\n[bold yellow]⚠ Warning: {w}[/bold yellow]\n")
+
     if not playlist_data.tracks:
         console.print(f"[bold yellow]Warning: Playlist '{playlist_data.name}' contains 0 tracks.[/bold yellow]")
         return 0
@@ -531,6 +573,7 @@ def main() -> int:
             f"[bold]Source Mode:[/] {playlist_data.source_type}\n"
             f"[bold]Total Tracks:[/] {len(playlist_data.tracks)}\n"
             f"[bold]Match Threshold:[/] {args.threshold}%\n"
+            f"[bold]Workers:[/] {args.workers}\n"
             f"[bold]Dry Run:[/] {'Yes' if args.dry_run else 'No'}",
             title="[bold green]Playlist Sync[/bold green]",
             border_style="green",
@@ -571,6 +614,7 @@ def main() -> int:
             tracks=playlist_data.tracks,
             threshold=float(args.threshold),
             progress_callback=on_track_match,
+            max_workers=args.workers,
         )
 
     # 5. Display summary

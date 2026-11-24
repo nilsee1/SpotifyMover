@@ -37,13 +37,22 @@ def test_strip_diacritics():
         ("Blinding Lights (Single Version)", "blinding lights"),
         ("Wonderwall - Radio Edit", "wonderwall"),
         ("In The End [Deluxe Edition]", "in the end"),
-        ("Hotel California (Live On MTV, 1994)", "hotel california"),
         ("Time - 50th Anniversary Edition", "time"),
-        # Diacritics + Punctuation
+        # Preserved versions (live, acoustic, remix) must NOT be stripped
+        ("Song (Acoustic Version)", "song acoustic version"),
+        ("Song (Live at Red Rocks)", "song live at red rocks"),
+        ("Song (Club Remix)", "song club remix"),
+        ("Song - Live", "song live"),
+        ("Song - Acoustic Version", "song acoustic version"),
+        ("Hotel California (Live On MTV, 1994)", "hotel california live on mtv 1994"),
+        # Diacritics + Punctuation + Apostrophe handling
         ("Hélène", "helene"),
         ("Rock & Roll", "rock roll"),
-        ("Don't Stop Me Now", "don t stop me now"),
+        ("Don't Stop Me Now", "dont stop me now"),
+        ("Don't Stop Believin'", "dont stop believin"),
         ("Where Is My Mind?", "where is my mind"),
+        ("Rock 'n' Roll", "rock n roll"),
+        ("It's A Long Way To The Top", "its a long way to the top"),
     ],
 )
 def test_normalize_title(raw_title, expected):
@@ -59,6 +68,7 @@ def test_normalize_title(raw_title, expected):
         ("Guns N' Roses", "guns n roses"),
         ("Simon & Garfunkel", "simon garfunkel"),
         ("Daft Punk feat. Pharrell Williams", "daft punk"),
+        ("Don't Stop", "dont stop"),
     ],
 )
 def test_normalize_artist(raw_artist, expected):

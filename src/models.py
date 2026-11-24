@@ -57,6 +57,8 @@ class PlaylistData:
     name: str
     tracks: list[Track] = field(default_factory=list)
     source_type: str = "unknown"
+    warnings: list[str] = field(default_factory=list)
+    is_truncated: bool = False
 
 
 @dataclass
@@ -95,4 +97,3 @@ class LidarrSyncSummary:
     tagged_artist_ids: list[int] = field(default_factory=list)
     search_triggered: bool = False
     search_command_id: int | None = None
-

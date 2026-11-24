@@ -3,7 +3,11 @@
 import io
 from pathlib import Path
 import pytest
-from src.sources.exportify_csv import derive_playlist_name_from_path, parse_exportify_csv
+from src.sources.exportify_csv import (
+    _split_artist_string,
+    derive_playlist_name_from_path,
+    parse_exportify_csv,
+)
 
 
 def test_derive_playlist_name_from_path():
@@ -12,18 +16,31 @@ def test_derive_playlist_name_from_path():
     assert derive_playlist_name_from_path("80s_pop.csv") == "80s pop"
 
 
+def test_split_artist_string_semicolon_with_comma_in_name():
+    # Semicolon-separated artists where one artist contains a comma
+    raw = "Tyler, The Creator; Kali Uchis"
+    assert _split_artist_string(raw) == ["Tyler, The Creator", "Kali Uchis"]
+
+
+def test_split_artist_string_comma_fallback():
+    # Comma-separated artists when no semicolon is present
+    raw = "Kendrick Lamar, SZA"
+    assert _split_artist_string(raw) == ["Kendrick Lamar", "SZA"]
+
+
 def test_parse_exportify_csv_standard():
     csv_data = (
         "Track Name,Artist Name(s),Album Name,Duration (ms)\n"
         "Blinding Lights,The Weeknd,After Hours,200040\n"
         '"Levitating","Dua Lipa, DaBaby","Future Nostalgia",203064\n'
         '"Get Lucky","Daft Punk; Pharrell Williams","Random Access Memories",369626\n'
+        '"See You Again","Tyler, The Creator; Kali Uchis","Flower Boy",180000\n'
     )
     f = io.StringIO(csv_data)
     playlist = parse_exportify_csv(f, default_name="Test Mix")
 
     assert playlist.name == "Test Mix"
-    assert len(playlist.tracks) == 3
+    assert len(playlist.tracks) == 4
 
     t1 = playlist.tracks[0]
     assert t1.title == "Blinding Lights"
@@ -38,6 +55,10 @@ def test_parse_exportify_csv_standard():
     t3 = playlist.tracks[2]
     assert t3.title == "Get Lucky"
     assert t3.artists == ["Daft Punk", "Pharrell Williams"]
+
+    t4 = playlist.tracks[3]
+    assert t4.title == "See You Again"
+    assert t4.artists == ["Tyler, The Creator", "Kali Uchis"]
 
 
 def test_parse_exportify_csv_utf8_bom(tmp_path: Path):
