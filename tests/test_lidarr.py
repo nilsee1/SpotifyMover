@@ -14,7 +14,9 @@ from src.lidarr import (
     LidarrError,
     apply_lidarr_plans,
     build_lidarr_plans,
+    import_lidarr_artists,
     load_lidarr_config,
+    monitor_lidarr_albums,
 )
 from src.models import (
     LidarrAlbumPlan,
@@ -435,3 +437,131 @@ def test_trigger_album_search_batched_only_when_requested():
                     mock_cmd.assert_called_once_with([7001])
                     assert summary.search_triggered is True
                     assert summary.search_command_id == 345
+
+
+# =====================================================================
+# 5. Two-Phase Workflow & Fallback Add Album Payload Tests
+# =====================================================================
+
+def test_import_lidarr_artists_phase_one():
+    """Verify Phase 1 adds artists with monitor=none, tags them, and updates plan lidarr_artist."""
+    client = LidarrClient(url="https://lidarr.local", api_key="test")
+    plan = LidarrAlbumPlan(
+        group=MissingAlbumGroup(artist="Selena Gomez", album="Rare"),
+        status="new_artist_and_album",
+        lidarr_album={"foreignAlbumId": "rg-rare", "title": "Rare"},
+        lidarr_artist={"artistName": "Selena Gomez", "foreignArtistId": "mbid-selena"},
+        resolved_artist_name="Selena Gomez",
+        resolved_album_title="Rare",
+    )
+
+    with mock.patch.object(client, "ensure_tag", return_value=7):
+        with mock.patch.object(client, "add_artist", return_value={"id": 88, "artistName": "Selena Gomez"}) as mock_add:
+            summary, count = import_lidarr_artists(
+                client=client,
+                plans=[plan],
+                root_folder="/music",
+                quality_profile_id=2,
+                metadata_profile_id=3,
+                tag="SpotifyMoverTool",
+            )
+
+            assert count == 1
+            assert summary.added_artists == ["Selena Gomez"]
+            assert 88 in summary.tagged_artist_ids
+            assert plan.lidarr_artist == {"id": 88, "artistName": "Selena Gomez"}
+            mock_add.assert_called_once()
+            called_payload = mock_add.call_args[0][0]
+            assert called_payload["addOptions"] == {"monitor": "none", "searchForMissingAlbums": False}
+            assert called_payload["qualityProfileId"] == 2
+            assert called_payload["metadataProfileId"] == 3
+            assert called_payload["rootFolderPath"] == "/music"
+
+
+def test_monitor_lidarr_albums_fallback_add_album_payload_valid():
+    """Verify that if target album is not yet in Lidarr, add_album fallback sends valid Artist payload.
+
+    This ensures Lidarr HTTP 400 (Artist.QualityProfileId must be > 0, Artist.RootFolderPath null)
+    does NOT happen when adding an album.
+    """
+    client = LidarrClient(url="https://lidarr.local", api_key="test")
+    plan = LidarrAlbumPlan(
+        group=MissingAlbumGroup(artist="Selena Gomez", album="Rare"),
+        status="new_artist_and_album",
+        lidarr_album={
+            "foreignAlbumId": "rg-rare",
+            "title": "Rare",
+            "artist": {
+                # Dummy values returned by Lidarr lookup_album
+                "artistName": "Selena Gomez",
+                "foreignArtistId": "mbid-selena",
+                "qualityProfileId": 0,
+                "metadataProfileId": 0,
+                "rootFolderPath": None,
+            },
+        },
+        lidarr_artist={"id": 88, "artistName": "Selena Gomez", "foreignArtistId": "mbid-selena"},
+        resolved_artist_name="Selena Gomez",
+        resolved_album_title="Rare",
+    )
+
+    # get_artist_albums returns empty list (simulating Lidarr still refreshing metadata)
+    with mock.patch.object(client, "get_artist_albums", return_value=[]):
+        with mock.patch.object(client, "add_album", return_value={"id": 999, "title": "Rare"}) as mock_add_alb:
+            with mock.patch.object(client, "monitor_albums") as mock_mon:
+                summary = monitor_lidarr_albums(
+                    client=client,
+                    plans=[plan],
+                    root_folder="/music",
+                    quality_profile_id=5,
+                    metadata_profile_id=4,
+                    album_lookup_retries=0,  # test immediate fallback
+                )
+
+                mock_add_alb.assert_called_once()
+                sent_album_payload = mock_add_alb.call_args[0][0]
+
+                # Assert that artist config in album payload was populated with valid fields
+                assert sent_album_payload["artistId"] == 88
+                assert sent_album_payload["artist"]["qualityProfileId"] == 5
+                assert sent_album_payload["artist"]["metadataProfileId"] == 4
+                assert sent_album_payload["artist"]["rootFolderPath"] == "/music"
+
+                # Assert monitored and added to summary
+                mock_mon.assert_called_once_with([999], monitored=True)
+                assert "Selena Gomez - Rare" in summary.monitored_albums
+
+
+def test_monitor_lidarr_albums_retries_when_loading():
+    """Verify monitor_lidarr_albums retries checking get_artist_albums if album is initially missing."""
+    client = LidarrClient(url="https://lidarr.local", api_key="test")
+    plan = LidarrAlbumPlan(
+        group=MissingAlbumGroup(artist="Artist", album="Album"),
+        status="new_artist_and_album",
+        lidarr_album={"foreignAlbumId": "rg-1", "title": "Album"},
+        lidarr_artist={"id": 42, "artistName": "Artist"},
+        resolved_artist_name="Artist",
+        resolved_album_title="Album",
+    )
+
+    # First call returns empty, second call returns album
+    responses = [
+        [],
+        [{"id": 4201, "foreignAlbumId": "rg-1", "title": "Album"}],
+    ]
+
+    with mock.patch.object(client, "get_artist_albums", side_effect=responses):
+        with mock.patch.object(client, "monitor_albums") as mock_mon:
+            with mock.patch("time.sleep"):  # do not slow down tests
+                summary = monitor_lidarr_albums(
+                    client=client,
+                    plans=[plan],
+                    root_folder="/music",
+                    quality_profile_id=1,
+                    metadata_profile_id=1,
+                    album_lookup_retries=2,
+                    album_lookup_delay=0.01,
+                )
+
+                mock_mon.assert_called_once_with([4201], monitored=True)
+                assert summary.monitored_albums == ["Artist - Album"]

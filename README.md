@@ -148,6 +148,7 @@ If you run `./sync_playlist.py` without arguments, you will be prompted interact
 | `--lidarr-search` | Immediately trigger an `AlbumSearch` command in Lidarr for all newly monitored albums. |
 | `--lidarr-min-tracks <int>` | Only send an album to Lidarr if at least `N` missing tracks belong to it (default: `1`). |
 | `--lidarr-select` | Interactively choose which resolved albums to send to Lidarr (`all`, `none`, or e.g. `1,3-5`). |
+| `--lidarr-delay <int>` | Optional delay in seconds before monitoring albums after artist import (useful in scripted runs). |
 | `--yes`, `-y` | Skip interactive confirmation prompts (useful for automation/cronjobs). |
 
 ---
@@ -211,5 +212,8 @@ pytest -v
 
 - **Playlists with > 100 tracks:** Spotify's public embed page caps results at 100 tracks. For larger playlists or private playlists, use [Exportify](https://exportify.net) to download a `.csv` file with one click and run `sync_playlist.py` on the downloaded file.
 - **Fuzzy matching threshold:** The default threshold is `80`. If you have different editions of songs and want looser matching, try `--threshold 75`. For strict matching, try `--threshold 85` or `90`.
-- **Lidarr Discography Safety:** SpotifyMover will *never* monitor an artist's full discography. When an artist is newly added to Lidarr, their discography is set to unmonitored (`addOptions.monitor = "none"`), and only the specific album containing the missing tracks is monitored.
+- **Lidarr Discography Safety & Two-Phase Sync:** SpotifyMover will *never* monitor an artist's full discography. When an artist is newly added to Lidarr, their discography is set to unmonitored (`addOptions.monitor = "none"`). The tool executes in two phases:
+  1. **Phase 1 (Artist Import):** Adds missing artists with monitoring disabled and applies the tag. Lidarr then fetches metadata and discographies from MusicBrainz in the background.
+  2. **Confirmation Gate & Polling:** Prompts the user once Lidarr has finished loading metadata (or waits via `--lidarr-delay`), retrying album lookups automatically.
+  3. **Phase 2 (Album Monitoring):** Locates the specific target albums under the artists and explicitly enables monitoring only for those albums.
 - **Lidarr Tagging:** All artists added or modified by SpotifyMover receive the `SpotifyMoverTool` tag (configurable via `LIDARR_TAG`), making it easy to filter or manage them in the Lidarr UI.
